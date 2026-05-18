@@ -1,0 +1,198 @@
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GPSナビ付き記録システム</title>
+    
+    <!-- 安定して動く最新の地図ライブラリを読み込み（今回はバグが起きない特別な配信元を使用） -->
+    <link rel="stylesheet" href="https://cloudflare.com" />
+    <script src="https://cloudflare.com"></script>
+
+    <style>
+        body { font-family: sans-serif; margin: 0; padding: 15px; text-align: center; background: #f3f4f6; color: #333; }
+        h2 { margin: 5px 0 10px 0; color: #111; font-size: 20px; }
+        
+        /* 画面上部に固定する地図のスタイル */
+        #map { height: 280px; width: 100%; border-radius: 12px; margin-bottom: 15px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); box-sizing: border-box; }
+        
+        .card { background: white; padding: 12px; border-radius: 12px; margin-bottom: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); text-align: left; }
+        .card-title { font-weight: bold; margin-bottom: 5px; color: #4b5563; font-size: 13px; border-bottom: 1px solid #e5e7eb; padding-bottom: 4px; }
+        
+        /* 接近アラート画面のスタイル */
+        #alert-area { display: none; background: #fee2e2; border: 2px solid #ef4444; border-radius: 12px; padding: 15px; margin-bottom: 15px; text-align: left; animation: pulse 2s infinite; }
+        @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); } 70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); } 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); } }
+        .alert-title { font-size: 16px; font-weight: bold; color: #b91c1c; margin-bottom: 5px; }
+        
+        input { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #ccc; border-radius: 6px; font-size: 16px; box-sizing: border-box; }
+        .btn-container { display: flex; justify-content: center; gap: 10px; margin-top: 5px; }
+        button { flex: 1; padding: 15px; font-size: 18px; font-weight: bold; border: none; border-radius: 8px; cursor: pointer; color: white; }
+        .btn-yes { background: #10b981; }
+        .btn-no { background: #ef4444; }
+        #status { font-size: 13px; color: #6b7280; margin-top: 10px; text-align: center; }
+    </style>
+</head>
+<body>
+
+    <h2>GPSナビ＆活動記録</h2>
+
+    <!-- 移動に合わせて自動スクロールする地図 -->
+    <div id="map">地図を初期化中...</div>
+
+    <!-- 1. 【自動出現】過去のデータ接近アラート -->
+    <div id="alert-area">
+        <div class="alert-title">⚠️ 過去の記録場所に接近中！</div>
+        <div id="past-data-display" style="font-size: 14px; margin-bottom: 10px; line-height: 1.4;"></div>
+        
+        <div class="card-title" style="border-bottom: 1px solid #fca5a5; color: #991b1b;">📝 今回の情報を入力</div>
+        <input type="text" id="comment" placeholder="今回のコメントを入力（任意）">
+        <div class="btn-container">
+            <button class="btn-yes" onclick="sendData('会えた')">会えた</button>
+            <button class="btn-no" onclick="sendData('会えない')">会えない</button>
+        </div>
+    </div>
+
+    <!-- 2. 周辺情報カード -->
+    <div class="card">
+        <div class="card-title">🔍 周辺のデータ状況</div>
+        <div id="nearby-status">過去データを読み込んでいます...</div>
+    </div>
+
+    <p id="status">位置情報を追跡中...</p>
+
+    <script>
+        // ★【重要】ここにあなたのGASのウェブアプリURLを貼り付けてください
+        const gasUrl = "https://script.google.com/macros/s/AKfycbx_AjTTCAvRPPEOw7cV7HtvIlApOBqj4nHkKXSloPSOMTVfFw-MucVXt-wnJ5oXyLVV/exec"; 
+
+        let map;
+        let currentMarker; // 自分自身のピン
+        let pastRecords = []; // 過去データ
+        const TARGET_DISTANCE = 25; // 接近検知距離（メートル）
+
+        // 距離計算（ヒュベニの公式）
+        function getDistance(lat1, lng1, lat2, lng2) {
+            const rad = x => x * Math.PI / 180;
+            const rx = 6378137.0;
+            const ry = 6356752.314245;
+            const dy = rad(lat1 - lat2);
+            const dx = rad(lng1 - lng2);
+            const my = rad((lat1 + lat2) / 2);
+            const e2 = (rx*rx - ry*ry) / (rx*rx);
+            const w = Math.sqrt(1 - e2 * Math.sin(my) * Math.sin(my));
+            const m = rx * (1 - e2) / (w*w*w);
+            const n = rx / w;
+            return Math.sqrt(Math.pow(dy*m, 2) + Math.pow(dx*n*Math.cos(my), 2));
+        }
+
+        // ページ起動時の処理
+        window.onload = () => {
+            if (gasUrl === "YOUR_WEB_APP_URL") {
+                alert("GASのURLを設定してください！");
+                return;
+            }
+            
+            // 最初に一度現在地を取得して、地図をその場所で初期化する
+            navigator.geolocation.getCurrentPosition((pos) => {
+                const lat = pos.coords.latitude;
+                const lng = pos.coords.longitude;
+                
+                // 地図の初期化
+                map = L.map('map').setView([lat, lng], 17);
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+                
+                // 自分の現在地ピン（青い丸などのカスタムにせず、区別のためメッセージ付きの通常ピン）
+                currentMarker = L.marker([lat, lng]).addTo(map).bindPopup("<b>現在地</b>").openPopup();
+                
+                // 過去データの読み込み開始
+                loadPastData();
+            }, () => {
+                document.getElementById('map').innerText = "GPSを許可してページを再読み込みしてください。";
+            });
+        };
+
+        // 過去データをスプレッドシートから読み込んで地図にすべて配置する
+        function loadPastData() {
+            fetch(gasUrl + "?action=read")
+                .then(res => res.json())
+                .then(data => {
+                    pastRecords = data;
+                    document.getElementById("nearby-status").innerText = "周辺の過去データを " + data.length + " 件表示しました。";
+                    
+                    // 過去の家をすべて地図に赤いピン（または通常のピン）で立てる
+                    data.forEach(record => {
+                        const dateStr = new Date(record.dateTime).toLocaleDateString('ja-JP');
+                        L.marker([record.lat, record.lng])
+                         .addTo(map)
+                         .bindPopup(`<b>過去の記録</b><br>日付: ${dateStr}<br>結果: ${record.status}<br>メモ: ${record.comment || 'なし'}`);
+                    });
+                    
+                    // リアルタイム追跡＆スクロール開始
+                    startTracking();
+                })
+                .catch(() => {
+                    document.getElementById("nearby-status").innerText = "過去データの読み込みに失敗しました。";
+                    startTracking();
+                });
+        }
+
+        // 移動に合わせて自分を動かし、地図をスクロールする
+        function startTracking() {
+            navigator.geolocation.watchPosition((pos) => {
+                const currentLat = pos.coords.latitude;
+                const currentLng = pos.coords.longitude;
+                
+                // 【完璧スクロール機能】現在地が中心になるように地図を自動移動
+                map.panTo([currentLat, currentLng]);
+                currentMarker.setLatLng([currentLat, currentLng]);
+                
+                let closeHouse = null;
+                let minDistance = Infinity;
+
+                // 距離チェック
+                pastRecords.forEach(record => {
+                    const dist = getDistance(currentLat, currentLng, record.lat, record.lng);
+                    if (dist < minDistance) {
+                        minDistance = dist;
+                        closeHouse = record;
+                    }
+                });
+
+                // 接近判定
+                const alertArea = document.getElementById("alert-area");
+                if (closeHouse && minDistance <= TARGET_DISTANCE) {
+                    const dateStr = new Date(closeHouse.dateTime).toLocaleString('ja-JP');
+                    document.getElementById("past-data-display").innerHTML = 
+                        "<b>距離:</b> 約" + Math.round(minDistance) + "m<br>" +
+                        "<b>前回の訪問日:</b> " + dateStr + "<br>" +
+                        "<b>前回の結果:</b> " + closeHouse.status + "<br>" +
+                        "<b>前回のメモ:</b> " + (closeHouse.comment || "なし");
+                    alertArea.style.display = "block";
+                } else {
+                    alertArea.style.display = "none";
+                    if (closeHouse) {
+                        document.getElementById("nearby-status").innerText = "一番近い記録場所まで、あと約 " + Math.round(minDistance) + "m です。";
+                    }
+                }
+            }, null, { enableHighAccuracy: true });
+        }
+
+        // 送信処理
+        function sendData(statusResult) {
+            const statusLabel = document.getElementById("status");
+            const commentValue = document.getElementById("comment").value;
+            statusLabel.innerText = "データを送信中...";
+
+            navigator.geolocation.getCurrentPosition((position) => {
+                const lat = position.coords.latitude;
+                const lng = position.coords.longitude;
+                const finalUrl = gasUrl + "?lat=" + lat + "&lng=" + lng + "&status=" + encodeURIComponent(statusResult) + "&comment=" + encodeURIComponent(commentValue);
+                
+                fetch(finalUrl, { mode: 'no-cors' })
+                    .then(() => {
+                        statusLabel.innerText = "✅ 保存しました！ (" + statusResult + ")";
+                        document.getElementById("comment").value = ""; 
+                        setTimeout(() => { location.reload(); }, 1200); // 画面を更新して最新ピンを反映
+                    })
+                    .catch(() => { statusLabel.innerText = "❌ 送信エラー"; });
+            });
+        }
+    </script>
